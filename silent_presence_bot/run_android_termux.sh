@@ -15,14 +15,14 @@ pkg update -y -q && pkg upgrade -y -q
 
 # Install system dependencies
 echo "[2/5] Installing system packages..."
-pkg install -y python python-pip tesseract libjpeg-turbo libpng x11-repo 2>/dev/null
+pkg install -y python python-pip tesseract libjpeg-turbo libpng 2>/dev/null
 
 # Try installing chromium for Termux (optional, may fail on some devices)
 pkg install -y chromium 2>/dev/null && echo "✅ Chromium installed" || echo "⚠️  Chromium not available — will use patchright fallback"
 
 # Install Python packages
 echo "[3/5] Installing Python packages..."
-pip install flask pytesseract Pillow requests --quiet
+pip install flask easyocr pytesseract Pillow numpy requests pandas openpyxl --quiet
 pip install playwright --quiet || pip install patchright --quiet
 
 # Install Playwright browsers
@@ -30,16 +30,7 @@ echo "[4/5] Installing browser automation..."
 python -m playwright install firefox 2>/dev/null || \
 echo "⚠️  Browser install skipped — may need manual setup"
 
-# Patch Tesseract path for Termux
-TESS_PATH=$(which tesseract 2>/dev/null)
-if [ -z "$TESS_PATH" ]; then
-    echo "⚠️  Tesseract not found — OCR will be limited"
-else
-    echo "✅ Tesseract found at: $TESS_PATH"
-    # Inject path into app.py if needed
-    sed -i "s|# pytesseract.pytesseract.tesseract_cmd|pytesseract.pytesseract.tesseract_cmd|" app.py 2>/dev/null
-    sed -i "s|TESSERACT_PATH_PLACEHOLDER|$TESS_PATH|" app.py 2>/dev/null
-fi
+echo "✅ EasyOCR will download its model (~200MB) on first run automatically."
 
 # Launch
 echo "[5/5] Launching bot..."

@@ -16,28 +16,29 @@ if errorlevel 1 (
 )
 
 :: Install dependencies
-echo [1/3] Installing Python packages...
-pip install flask playwright pytesseract Pillow requests --quiet --break-system-packages 2>nul || pip install flask playwright pytesseract Pillow requests --quiet
+echo [1/4] Installing Python packages (EasyOCR download ~200MB on first run)...
+pip install flask playwright easyocr pytesseract Pillow numpy requests pandas openpyxl --quiet
 
 :: Install Playwright browser
-echo [2/3] Installing Playwright browser (Firefox)...
+echo [2/4] Installing Playwright browser (Firefox)...
 python -m playwright install firefox
 
 :: Check Tesseract
+echo [3/4] Checking for Tesseract OCR (second engine)...
 where tesseract >nul 2>&1
 if errorlevel 1 (
     echo.
-    echo [WARNING] Tesseract OCR not found!
+    echo [WARNING] Tesseract OCR not found on PATH!
+    echo   The bot will still run on EasyOCR alone, but for best accuracy:
     echo   Download from: https://github.com/UB-Mannheim/tesseract/wiki
-    echo   Install it, then re-run this script.
-    echo   Default install path: C:\Program Files\Tesseract-OCR\tesseract.exe
+    echo   Install it, tick "Add to PATH", then re-run this script.
     echo.
-    echo   After installing, add it to PATH or the app will prompt you.
-    pause
+) else (
+    echo   Tesseract found — both OCR engines will run.
 )
 
 :: Launch
-echo [3/3] Launching bot...
+echo [4/4] Launching bot...
 echo.
 echo   Your browser will open automatically at http://localhost:7842
 echo   Keep this window open while the bot is running.

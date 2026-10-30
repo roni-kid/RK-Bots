@@ -9,9 +9,32 @@ from pathlib import Path
 from datetime import datetime
 from io import BytesIO
 from flask import Flask, render_template_string, request, jsonify, send_from_directory
-from PIL import Image
-import pytesseract
+from PIL import Image, ImageFilter, ImageEnhance
+import numpy as np
+from difflib import SequenceMatcher
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
+from roster import load_roster, match_all_ocr_fragments
+
+try:
+    import pytesseract
+    _TESSERACT_AVAILABLE = True
+except ImportError:
+    _TESSERACT_AVAILABLE = False
+
+def name_similarity(a, b):
+    """0.0–1.0 similarity between two names, tolerant of OCR noise."""
+    return SequenceMatcher(None, a.upper().strip(), b.upper().strip()).ratio()
+
+# ── EasyOCR loader (lazy — downloaded once on first use) ───────────────────
+_easyocr_reader = None
+def get_ocr_reader():
+    global _easyocr_reader
+    if _easyocr_reader is None:
+        emit("⬇️  Loading EasyOCR model (first run only — may take ~30s)…")
+        import easyocr
+        _easyocr_reader = easyocr.Reader(["en"], gpu=False, verbose=False)
+        emit("✅ EasyOCR model ready.")
+    return _easyocr_reader
 
 # ── Config ─────────────────────────────────────────────────────────────────
 BASE_URL   = "https://mainsp.gctu.edu.gh"
@@ -57,6 +80,15 @@ COURSE_ALIASES = {
     "PHY 241": "PHY 241",
 }
 
+# Noise words that are never student names
+HEADER_NOISE = re.compile(
+    r"(COURSE|LECTURER|DATE|CLASS.?REP|SIGN|INDEX|FACULTY|DEPARTMENT|"
+    r"UNIVERSITY|SEMESTER|SESSION|ACADEMIC|LEVEL|TITLE|CONTACT|START|"
+    r"FINISH|GHANA|COMMUNICATION|TECHNOLOGY|ENGINEERING|ATTENDANCE|"
+    r"SHEET|PROGRAMME|PROG|NO\b|NAME\b|NUMBER\b|FIRST|SECOND|THIRD)",
+    re.IGNORECASE,
+)
+
 def emit(msg, level="info"):
     ts = datetime.now().strftime("%H:%M:%S")
     entry = {"ts": ts, "msg": msg, "level": level}
@@ -66,19 +98,85 @@ def emit(msg, level="info"):
     else:
         log.info(msg)
 
-def ocr_image(path):
-    """Run Tesseract OCR on an image, return raw text."""
-    img = Image.open(path)
-    # Upscale for better OCR
+def preprocess_image(path):
+    """
+    Enhance the image before OCR:
+    - Upscale 2.5×  for more detail
+    - Convert to greyscale
+    - Sharpen edges (handwriting benefits from this)
+    - Boost contrast so light pencil lines become darker
+    Returns a numpy array (uint8) ready for EasyOCR.
+    """
+    img = Image.open(path).convert("RGB")
     w, h = img.size
-    img = img.resize((w * 2, h * 2), Image.LANCZOS)
-    # Convert to grayscale
+    # Upscale
+    img = img.resize((int(w * 2.5), int(h * 2.5)), Image.LANCZOS)
+    # Greyscale
     img = img.convert("L")
-    text = pytesseract.image_to_string(img, config="--psm 6")
-    return text
+    # Sharpen
+    img = img.filter(ImageFilter.SHARPEN)
+    img = img.filter(ImageFilter.SHARPEN)
+    # Boost contrast
+    img = ImageEnhance.Contrast(img).enhance(2.0)
+    # Convert to numpy for EasyOCR
+    return np.array(img)
+
+def ocr_image_easyocr(path):
+    """
+    Run EasyOCR on the image.
+    Returns (full_text: str, results: list[dict])
+    Each result dict: {text, bbox, confidence}
+    bbox = [[x1,y1],[x2,y2],[x3,y3],[x4,y4]]  (top-left → clockwise)
+    """
+    reader = get_ocr_reader()
+    img_np = preprocess_image(path)
+    emit("🔍 Running EasyOCR on preprocessed image…")
+    raw = reader.readtext(img_np, detail=1, paragraph=False)
+    # raw items: (bbox, text, confidence)
+    results = []
+    lines   = []
+    for bbox, text, conf in raw:
+        text = text.strip()
+        if text:
+            results.append({"text": text, "bbox": bbox, "conf": conf})
+            lines.append(text)
+            emit(f"  OCR [{conf:.2f}]: {text}")
+    full_text = "\n".join(lines)
+    return full_text, results
+
+def ocr_image_tesseract(path):
+    """
+    Run Tesseract as a SECOND, independent OCR pass. Tesseract and EasyOCR
+    have different failure modes (Tesseract is tuned for print but still
+    catches some handwriting fragments EasyOCR's detector misses, or reads
+    a noisy fragment more cleanly) — running both and merging candidates
+    into one pool before roster-matching gives the best chance of a correct
+    read on any given row, since we only need ONE of the two engines to get
+    a name right for the roster matcher to recover the full, correct name.
+
+    Returns a flat list of line strings (no bbox/confidence — Tesseract's
+    confidence scores are unreliable on handwriting, so we don't use them
+    for filtering; the roster-match score is the real quality gate).
+    """
+    if not _TESSERACT_AVAILABLE:
+        emit("⚠️  pytesseract not installed — skipping Tesseract pass (EasyOCR only).", "warn")
+        return []
+    try:
+        img_np = preprocess_image(path)
+        img = Image.fromarray(img_np)
+        emit("🔍 Running Tesseract (second OCR engine) on preprocessed image…")
+        # psm 6 = assume a single uniform block of text (good for a table region)
+        raw_text = pytesseract.image_to_string(img, config="--psm 6")
+        lines = [l.strip() for l in raw_text.splitlines() if l.strip()]
+        for l in lines:
+            emit(f"  Tesseract: {l}")
+        return lines
+    except Exception as e:
+        emit(f"⚠️  Tesseract pass failed ({e}) — continuing with EasyOCR only.", "warn")
+        return []
 
 def extract_course_from_text(text):
-    """Try to detect course code or title from OCR text."""
+    """Detect course code from OCR text."""
     text_upper = text.upper()
     for keyword, code in COURSE_ALIASES.items():
         if keyword.upper() in text_upper:
@@ -86,11 +184,12 @@ def extract_course_from_text(text):
     return None
 
 def extract_date_from_text(text):
-    """Try to extract a date from OCR text (various formats)."""
+    """Extract a date string from OCR text."""
     patterns = [
-        r"(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})",   # 28/10/2026 or 28-10-26
-        r"(\d{1,2})\s+(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[,\s]+(\d{4})",
+        r"(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})",
+        r"(\d{1,2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[,\s]+(\d{4})",
         r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{1,2})[,\s]+(\d{4})",
+        r"(\d{1,2})\s*(Oct|Nov|Dec|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep)[a-z]*\.?\s*,?\s*(\d{4})",
     ]
     for p in patterns:
         m = re.search(p, text, re.IGNORECASE)
@@ -98,62 +197,124 @@ def extract_date_from_text(text):
             return m.group(0).strip()
     return None
 
-def parse_student_names(text):
+def is_likely_name(text):
     """
-    Parse the NAME column from the attendance sheet OCR text.
-    Returns a list of full name strings.
+    Returns True if a text fragment looks like a (possibly OCR-mangled)
+    student name fragment. Loosened for blurry handwriting: EasyOCR often
+    splits one handwritten name into several ragged boxes ("InSah", "Noble",
+    "0Lcpis") rather than one clean "FIRST LAST" string, so we accept single
+    word fragments too and tolerate a few stray digits/symbols mixed in by
+    misreads of cursive strokes — as long as most of the token is letters.
     """
-    names = []
-    lines = text.splitlines()
+    text = text.strip()
+    if len(text) < 2:
+        return False
+    if HEADER_NOISE.search(text):
+        return False
+    words = text.split()
+    if not (1 <= len(words) <= 6):
+        return False
+    for w in words:
+        clean = re.sub(r"[^A-Za-z0-9]", "", w)
+        if not clean:
+            return False
+        letters = sum(c.isalpha() for c in clean)
+        # Majority-letters test tolerates a misread digit or two inside a
+        # name (e.g. "0Lcpis") without accepting pure index numbers.
+        if letters / len(clean) < 0.6:
+            return False
+    return True
 
-    # Find the header row
-    header_idx = None
-    for i, line in enumerate(lines):
-        if re.search(r"NAME.*INDEX", line, re.IGNORECASE) or \
-           re.search(r"INDEX.*NAME", line, re.IGNORECASE) or \
-           re.search(r"^\s*NO\s+NAME", line, re.IGNORECASE):
-            header_idx = i
-            break
+def parse_student_names_from_results(results):
+    """
+    Use EasyOCR bbox positions to isolate the NAME column.
 
-    if header_idx is None:
-        # Fallback: look for lines that look like names after the header area
-        # (lines with 2+ capitalised words, no digits, not short)
-        for line in lines:
+    Strategy:
+      1. Find the header row containing "NAME" and "INDEX" — note their x-positions.
+      2. The NAME column occupies x-space roughly from left-of-NAME to left-of-INDEX.
+      3. All text blocks below the header row whose centre-x falls inside the NAME
+         column band AND pass is_likely_name() are student names.
+      4. Sort by vertical position (top-to-bottom) to preserve sheet order.
+    """
+    if not results:
+        return []
+
+    # Helper: centre of a bbox
+    def cx(bbox): return (bbox[0][0] + bbox[2][0]) / 2
+    def cy(bbox): return (bbox[0][1] + bbox[2][1]) / 2
+    def top(bbox): return bbox[0][1]
+
+    # ── Step 1: find header row ─────────────────────────────────────
+    header_y    = None
+    name_col_x  = None   # left edge of NAME column
+    index_col_x = None   # left edge of INDEX column
+
+    for r in results:
+        t = r["text"].upper().strip()
+        # Fuzzy header match: EasyOCR often misreads "NAME" as "NAML", "NAMC",
+        # etc. on blurry handwriting sheets — exact \bNAME\b missed this.
+        if len(t) <= 6 and name_similarity(t, "NAME") >= 0.7:
+            header_y   = cy(r["bbox"])
+            name_col_x = r["bbox"][0][0]   # left x of NAME cell
+        if "INDEX" in t or name_similarity(t, "INDEX") >= 0.7:
+            index_col_x = r["bbox"][0][0]
+
+    # ── Step 2: define the column band ─────────────────────────────
+    if name_col_x is not None and index_col_x is not None:
+        col_left  = name_col_x  - 20   # small tolerance
+        col_right = index_col_x + 20
+    else:
+        # Fallback: use left third of the image as "name column"
+        all_xs = [cx(r["bbox"]) for r in results]
+        col_left  = min(all_xs)
+        col_right = max(all_xs) * 0.55
+
+    emit(f"📐 Name column band: x={col_left:.0f} → {col_right:.0f}, header_y={header_y}")
+
+    # ── Step 3: collect name candidates below header ────────────────
+    candidates = []
+    for r in results:
+        # Must be below the header row
+        if header_y is not None and top(r["bbox"]) <= header_y + 10:
+            continue
+        # Centre x must fall inside name column band
+        x_centre = cx(r["bbox"])
+        if not (col_left <= x_centre <= col_right):
+            continue
+        # Confidence filter — being inside the verified NAME column already
+        # rules out most noise, so we can afford a lower bar here than for
+        # the unpositioned fallback scan below. Blurry handwriting routinely
+        # scores 0.1–0.3 even on a correctly-read name.
+        if r["conf"] < 0.10:
+            continue
+        text = r["text"].strip()
+        if is_likely_name(text):
+            candidates.append((top(r["bbox"]), text.upper()))
+
+    # ── Group fragments on the same table row into one name ──────────
+    # EasyOCR sometimes splits one handwritten name across 2+ boxes
+    # ("InSah" / "Noble" both sitting on the same ruled line). Merge any
+    # candidates whose top-y is within ~18px of each other (same row).
+    candidates.sort(key=lambda x: x[0])
+    grouped = []
+    for y, text in candidates:
+        if grouped and abs(y - grouped[-1][0]) <= 18:
+            grouped[-1] = (grouped[-1][0], grouped[-1][1] + " " + text)
+        else:
+            grouped.append((y, text))
+    names = list(dict.fromkeys(n for _, n in grouped))
+
+    # ── Step 4: fallback — if column detection found nothing, scan all ─
+    if not names:
+        emit("⚠️  Column detection found nothing — falling back to full-text name scan.", "warn")
+        all_text = "\n".join(r["text"] for r in results)
+        for line in all_text.splitlines():
             line = line.strip()
-            if len(line) < 5:
-                continue
-            # Skip lines that are headers / metadata
-            if re.search(r"(COURSE|LECTURER|DATE|CLASS REP|SIGN|INDEX|FACULTY|DEPARTMENT|UNIVERSITY|SEMESTER|SESSION|ACADEMIC|LEVEL|TITLE|CONTACT|START|FINISH)", line, re.IGNORECASE):
-                continue
-            # Skip lines that are mostly digits
-            if re.match(r"^\d+$", line.replace(" ", "")):
-                continue
-            # A name: 2–5 words, mostly letters
-            words = line.split()
-            if 2 <= len(words) <= 6 and all(re.match(r"[A-Za-z\-']+$", w) for w in words):
-                names.append(" ".join(w.upper() for w in words))
-        return names
+            if is_likely_name(line):
+                names.append(line.upper())
+        names = list(dict.fromkeys(names))
 
-    # Parse rows below the header
-    for line in lines[header_idx + 1:]:
-        line = line.strip()
-        if not line:
-            continue
-        # Remove leading row number
-        line = re.sub(r"^\d+[\.\s]+", "", line)
-        # Extract name: first block of words before index number (digits)
-        m = re.match(r"([A-Za-z\s'\-]+?)(?:\s{2,}|\t)(\d{5,})", line)
-        if m:
-            name = m.group(1).strip()
-            if len(name) > 3:
-                names.append(name.upper())
-            continue
-        # Fallback: if line has 2-5 words and no numbers, treat as name
-        words = line.split()
-        if 2 <= len(words) <= 5 and all(re.match(r"[A-Za-z\-']+$", w) for w in words):
-            names.append(" ".join(w.upper() for w in words))
-
-    return list(dict.fromkeys(names))  # deduplicate preserving order
+    return names
 
 # ── Playwright automation ──────────────────────────────────────────────────
 
@@ -164,18 +325,25 @@ def run_automation(credentials, image_path, manual_course=None, manual_date=None
     STATE["log"] = []
 
     try:
-        # ── Step 1: OCR ────────────────────────────────────────────
-        emit("📄 Running OCR on attendance sheet…")
-        raw_text = ocr_image(image_path)
-        emit(f"OCR raw text (first 500 chars):\n{raw_text[:500]}")
+        # ── Step 1: Dual OCR — EasyOCR (primary, handwriting-tuned) +
+        #           Tesseract (secondary, independent cross-check) ──────
+        emit("📄 Reading attendance sheet with EasyOCR (handwriting model)…")
+        raw_text, ocr_results = ocr_image_easyocr(image_path)
+        emit(f"📝 EasyOCR full text:\n{raw_text[:800]}")
+
+        tesseract_lines = ocr_image_tesseract(image_path)
+        # Tesseract output has no bbox, so it can't participate in the
+        # column-position parse — but its lines still go into the roster
+        # candidate pool below, catching rows EasyOCR's detector skipped.
+        combined_text = raw_text + "\n" + "\n".join(tesseract_lines)
 
         if mode == "auto":
-            course_code = extract_course_from_text(raw_text)
-            date_str    = extract_date_from_text(raw_text)
+            course_code = extract_course_from_text(combined_text)
+            date_str    = extract_date_from_text(combined_text)
             if course_code:
                 emit(f"✅ AUTO detected course: {course_code}")
             else:
-                emit("⚠️ Could not auto-detect course — will ask you to select manually on the page.", "warn")
+                emit("⚠️ Could not auto-detect course — please select manually on the page.", "warn")
             if date_str:
                 emit(f"✅ AUTO detected date: {date_str}")
             else:
@@ -185,12 +353,64 @@ def run_automation(credentials, image_path, manual_course=None, manual_date=None
             date_str    = manual_date
             emit(f"📋 MANUAL mode — Course: {course_code}  Date: {date_str}")
 
-        student_names = parse_student_names(raw_text)
-        STATE["counts"]["total"] = len(student_names)
-        emit(f"👥 Detected {len(student_names)} student(s) on sheet: {student_names}")
+        # ── Step 1b: Combine OCR candidates from both engines ──────────
+        easyocr_names = parse_student_names_from_results(ocr_results)
+        tesseract_names = [l for l in tesseract_lines if is_likely_name(l)]
+        all_candidates = list(dict.fromkeys(easyocr_names + tesseract_names))
+        emit(f"👥 Combined OCR candidates from both engines ({len(all_candidates)}): {all_candidates}")
+
+        if not all_candidates:
+            emit("❌ No student name fragments found by either engine. Tips: use a flat, well-lit photo with no shadows.", "error")
+            STATE["status"] = "error"
+            return
+
+        # ── Step 1c: Match every OCR fragment against the REAL class roster ──
+        emit("📋 Loading class roster (BCE_GROUP_B_LIST.xlsx)…")
+        roster = load_roster()
+        if roster:
+            emit(f"✅ Roster loaded: {len(roster)} students.")
+        else:
+            emit("⚠️  Roster file not found or empty — proceeding with raw OCR names (less reliable).", "warn")
+
+        matches = match_all_ocr_fragments(all_candidates, roster) if roster else []
+
+        confirmed  = [m for m in matches if m["matched"] and not m["ambiguous"]]
+        ambiguous  = [m for m in matches if m["matched"] and m["ambiguous"]]
+        unmatched  = [m for m in matches if not m["matched"]]
+
+        # De-duplicate confirmed matches by roster index (two OCR fragments
+        # might legitimately both resolve to the same already-grouped name)
+        seen_idx = set()
+        deduped_confirmed = []
+        for m in confirmed:
+            if m["index"] not in seen_idx:
+                seen_idx.add(m["index"])
+                deduped_confirmed.append(m)
+        confirmed = deduped_confirmed
+
+        emit(f"✅ {len(confirmed)} confidently matched to roster students.")
+        for m in confirmed:
+            emit(f"   {m['ocr_text']!r} → {m['raw_name']}  ({m['index']})  score={m['score']}")
+
+        if ambiguous:
+            emit(f"⚠️  {len(ambiguous)} AMBIGUOUS matches (same roster student claimed by multiple OCR reads — review needed):", "warn")
+            for m in ambiguous:
+                emit(f"   {m['ocr_text']!r} → {m['raw_name']} ({m['index']})  score={m['score']}", "warn")
+
+        if unmatched:
+            emit(f"⚠️  {len(unmatched)} OCR fragments could NOT be confidently matched to any roster student:", "warn")
+            for m in unmatched:
+                emit(f"   {m['ocr_text']!r}  (best score {m['score']})", "warn")
+
+        # Use roster names (reliable, correctly spelled, correctly ordered)
+        # for the actual portal search — NOT the raw OCR text — since the
+        # roster's "raw_name" is what the portal's own student list contains.
+        student_names = [m["raw_name"] for m in confirmed] if roster else all_candidates
+        STATE["counts"]["total"] = len(all_candidates)
+        STATE["counts"]["marked"] = 0
 
         if not student_names:
-            emit("❌ No student names found. Please check the image quality.", "error")
+            emit("❌ No OCR fragment could be confidently matched to a roster student. Try a clearer photo.", "error")
             STATE["status"] = "error"
             return
 
@@ -218,13 +438,44 @@ def run_automation(credentials, image_path, manual_course=None, manual_date=None
 
         login_btn = page.locator("button:has-text('Login'), button[type='submit'], input[type='submit']").first
         login_btn.click()
-        page.wait_for_url(f"{BASE_URL}/admin/**", timeout=15000)
+
+        # The portal appears to be a client-rendered app: the URL/DOM updates
+        # without firing a full "load"/"networkidle" navigation event, which is
+        # why wait_for_url used to time out. Instead, poll for either the URL
+        # changing away from /login OR a known post-login element showing up —
+        # and if neither appears in time, force a refresh (which you confirmed
+        # reveals the dashboard content) before giving up.
+        logged_in = False
+        for attempt in range(20):   # ~10s of polling
+            time.sleep(0.5)
+            if "/login" not in page.url:
+                logged_in = True
+                break
+            if page.locator("text=Dashboard, text=SilentPresence, text=Command Center").first.is_visible():
+                logged_in = True
+                break
+
+        if not logged_in:
+            emit("🔄 Login didn't confirm yet — refreshing page (matches manual behaviour)…", "warn")
+            page.reload(wait_until="load", timeout=20000)
+            time.sleep(1.5)
+            if "/login" in page.url:
+                raise Exception("Still on login page after refresh — check credentials.")
+
         emit("✅ Login successful!")
 
         # ── Step 4: Navigate to Attendance ─────────────────────────
         emit("📌 Navigating to Attendance page…")
-        page.goto(ATTEND_URL, wait_until="networkidle", timeout=20000)
+        page.goto(ATTEND_URL, wait_until="load", timeout=20000)
         time.sleep(1.5)
+        # Same SPA quirk can apply here — refresh once if the ledger content
+        # hasn't rendered yet (client-side data fetch didn't fire on first paint)
+        try:
+            page.locator("text=Attendance Ledger").first.wait_for(state="visible", timeout=3000)
+        except PlaywrightTimeout:
+            emit("🔄 Refreshing Attendance page to load data…", "warn")
+            page.reload(wait_until="load", timeout=20000)
+            time.sleep(1.5)
 
         # ── Step 5: Select course if auto-detected ─────────────────
         if course_code:
@@ -342,6 +593,27 @@ def run_automation(credentials, image_path, manual_course=None, manual_date=None
                             emit(f"  ✓ Ticked first result: {result_text[:60]}")
                             found = True
 
+                # Strategy 3: fuzzy match — handwriting OCR is rarely pixel-perfect,
+                # so pick the closest-scoring visible result instead of giving up.
+                if not found:
+                    best_item, best_score, best_text = None, 0.0, ""
+                    for item in result_items:
+                        item_text = item.inner_text().strip()
+                        if not item_text:
+                            continue
+                        score = name_similarity(name, item_text)
+                        if score > best_score:
+                            best_item, best_score, best_text = item, score, item_text
+                    if best_item is not None and best_score >= 0.55:
+                        cb = best_item.locator("input[type='checkbox']")
+                        if cb.count() > 0:
+                            if not cb.is_checked():
+                                cb.check()
+                        else:
+                            best_item.click()
+                        emit(f"  ✓ Fuzzy-matched ({best_score:.0%}): '{name}' → '{best_text[:50]}'", "warn")
+                        found = True
+
                 if not found:
                     emit(f"  ⚠️ Could not find '{name}' in results — skipping.", "warn")
                     failed.append(name)
@@ -392,14 +664,22 @@ def run_automation(credentials, image_path, manual_course=None, manual_date=None
                     pass
 
         # ── Done ───────────────────────────────────────────────────
+        # "failed" in the UI's red "Not Found" tray should show every name
+        # that still needs YOUR eyes: portal-search misses, plus any OCR
+        # fragment the roster matcher couldn't confidently resolve, plus
+        # ambiguous double-claims. Nothing gets silently dropped.
+        review_needed = failed[:]  # portal-search misses from the loop above
+        review_needed += [f"{m['ocr_text']} (unmatched)" for m in unmatched]
+        review_needed += [f"{m['ocr_text']} → {m['raw_name']}? (ambiguous)" for m in ambiguous]
+
         STATE["counts"]["marked"] = marked
-        STATE["counts"]["failed"] = failed
-        total = len(student_names)
+        STATE["counts"]["failed"] = review_needed
+        total = STATE["counts"]["total"]
         emit(f"")
         emit(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-        emit(f"✅ DONE — {marked}/{total} students marked present.")
-        if failed:
-            emit(f"⚠️  {len(failed)} not found: {', '.join(failed)}", "warn")
+        emit(f"✅ DONE — {marked}/{total} OCR-detected row(s) marked present on the portal.")
+        if review_needed:
+            emit(f"⚠️  {len(review_needed)} need your manual review: {', '.join(review_needed)}", "warn")
         emit(f"━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
         STATE["status"] = "done"
 
