@@ -36,6 +36,153 @@ def get_ocr_reader():
         emit("✅ EasyOCR model ready.")
     return _easyocr_reader
 
+# ── TrOCR loader (lazy — handwriting checkpoint, downloaded once) ──────────
+# TrOCR is a transformer-based OCR model from Microsoft that reads one LINE
+# of text at a time. It was trained specifically on handwritten text, so it
+# handles slant, irregular spacing, and letter-shape variation that confuse
+# EasyOCR and Tesseract. We use it as a RESCUE engine: only lines that
+# EasyOCR returned with low confidence are cropped and re-run through TrOCR.
+# This avoids the GPU cost of running TrOCR on every pixel of the sheet.
+_trocr_processor = None
+_trocr_model     = None
+_trocr_available = False
+
+def get_trocr():
+    """Return (processor, model) or (None, None) if transformers is missing."""
+    global _trocr_processor, _trocr_model, _trocr_available
+    if _trocr_processor is not None:
+        return _trocr_processor, _trocr_model
+    try:
+        from transformers import TrOCRProcessor, VisionEncoderDecoderModel
+        emit("⬇️  Loading TrOCR handwriting model (first run only — ~400 MB)…")
+        _trocr_processor = TrOCRProcessor.from_pretrained(
+            "microsoft/trocr-base-handwritten"
+        )
+        _trocr_model = VisionEncoderDecoderModel.from_pretrained(
+            "microsoft/trocr-base-handwritten"
+        )
+        _trocr_model.eval()
+        _trocr_available = True
+        emit("✅ TrOCR model ready.")
+    except Exception as e:
+        emit(f"⚠️  TrOCR unavailable ({e}) — continuing with EasyOCR + Tesseract only.", "warn")
+        _trocr_processor = None
+        _trocr_model     = None
+        _trocr_available = False
+    return _trocr_processor, _trocr_model
+
+# Confidence threshold below which EasyOCR lines are sent to TrOCR for
+# a second opinion. 0.5 means "less than 50% confident" — a safe floor
+# for noisy handwriting without making every line pay the TrOCR cost.
+TROCR_CONFIDENCE_THRESHOLD = 0.50
+
+def ocr_line_trocr(line_crop_np):
+    """
+    Run TrOCR on a single line crop (numpy uint8 array, greyscale or RGB).
+    Returns the recognised text string, or None if TrOCR is unavailable or fails.
+    TrOCR reads the whole image as ONE line, so the caller must pass a
+    tight crop of exactly one text row — which is what EasyOCR's bboxes give us.
+    """
+    processor, model = get_trocr()
+    if processor is None:
+        return None
+    try:
+        import torch
+        from PIL import Image as PILImage
+
+        # TrOCR expects an RGB PIL image
+        if line_crop_np.ndim == 2:
+            pil_img = PILImage.fromarray(line_crop_np).convert("RGB")
+        else:
+            pil_img = PILImage.fromarray(line_crop_np)
+
+        # Add a few pixels of white padding — tight crops can confuse the
+        # patch encoder at the image boundary.
+        padded = PILImage.new("RGB", (pil_img.width + 8, pil_img.height + 8), (255, 255, 255))
+        padded.paste(pil_img, (4, 4))
+
+        pixel_values = processor(images=padded, return_tensors="pt").pixel_values
+
+        with torch.no_grad():
+            generated_ids = model.generate(
+                pixel_values,
+                max_new_tokens=64,
+                num_beams=4,       # beam search gives better results than greedy
+                early_stopping=True,
+            )
+
+        text = processor.batch_decode(generated_ids, skip_special_tokens=True)[0].strip()
+        return text if text else None
+    except Exception as e:
+        emit(f"⚠️  TrOCR line read failed ({e})", "warn")
+        return None
+
+def trocr_rescore_low_confidence_lines(image_np, ocr_results):
+    """
+    For every EasyOCR result whose confidence is below TROCR_CONFIDENCE_THRESHOLD,
+    crop that bounding box from the full image and re-run TrOCR on it.
+    Returns a NEW results list where low-confidence items are replaced with
+    TrOCR's reading (marked with conf=0.70 as a neutral mid-confidence sentinel)
+    when TrOCR returns something non-empty.
+
+    High-confidence EasyOCR lines pass through unchanged — we don't pay
+    the TrOCR cost for text EasyOCR already read well.
+    """
+    processor, _ = get_trocr()
+    if processor is None:
+        # TrOCR not available — pass through unchanged
+        return ocr_results
+
+    upgraded = []
+    rescued = 0
+
+    for r in ocr_results:
+        if r["conf"] >= TROCR_CONFIDENCE_THRESHOLD:
+            upgraded.append(r)
+            continue
+
+        # Crop the bounding box from the full image
+        # EasyOCR bbox: [[x1,y1],[x2,y2],[x3,y3],[x4,y4]] (top-left clockwise)
+        bbox = r["bbox"]
+        xs = [pt[0] for pt in bbox]
+        ys = [pt[1] for pt in bbox]
+        x1, x2 = max(0, int(min(xs)) - 4), min(image_np.shape[1], int(max(xs)) + 4)
+        y1, y2 = max(0, int(min(ys)) - 4), min(image_np.shape[0], int(max(ys)) + 4)
+
+        if x2 <= x1 or y2 <= y1:
+            upgraded.append(r)
+            continue
+
+        crop = image_np[y1:y2, x1:x2]
+        trocr_text = ocr_line_trocr(crop)
+
+        if trocr_text and trocr_text.strip():
+            emit(
+                f"  🔄 TrOCR rescued [{r['conf']:.2f}→0.70]: "
+                f"'{r['text']}' → '{trocr_text}'"
+            )
+            upgraded.append({
+                "text": trocr_text,
+                "bbox": r["bbox"],
+                # Use 0.70 as a neutral mid-confidence sentinel so this result
+                # passes the column-detection confidence filter (>0.10) but
+                # downstream code can still distinguish it from a high-confidence
+                # EasyOCR read (>0.80) if needed.
+                "conf": 0.70,
+                "source": "trocr",
+            })
+            rescued += 1
+        else:
+            # TrOCR also returned nothing useful — keep original
+            upgraded.append(r)
+
+    if rescued:
+        emit(f"✅ TrOCR rescued {rescued} low-confidence line(s).")
+    else:
+        emit("ℹ️  TrOCR: no low-confidence lines needed rescuing.")
+
+    return upgraded
+
 # ── Config ─────────────────────────────────────────────────────────────────
 BASE_URL   = "https://mainsp.gctu.edu.gh"
 LOGIN_URL  = f"{BASE_URL}/admin/login"
@@ -183,18 +330,167 @@ def extract_course_from_text(text):
             return code
     return None
 
+# Tolerates common OCR letter-swaps on handwritten month abbreviations
+# (t<->k, m<->n/rn, etc. are frequent confusions on cursive strokes).
+MONTH_RE = (
+    r"(Jan|Feb|Mar|Apr|Ma[yj]|Jun|Jul|Aug|Sep|"
+    r"Oc[tk]|Nov|De[cs])[a-z]*"
+)
+
+_DATE_PATTERNS = [
+    # Month-name dates are unambiguous — an index number can never produce
+    # "Oct" or "4 Oct", so these are safe to trust without extra validation.
+    # The day-number group tolerates 0-3 stray OCR characters right before
+    # the month (e.g. "4th" misread as "Ith", "Oct4" with a stuck digit) —
+    # we only need to recover ONE real digit for the day.
+    rf"[^\d]{{0,3}}(\d{{1,2}})[a-z\.]{{0,4}}\s*{MONTH_RE}\.?\s*,?\s*(\d{{3,4}})",
+    rf"{MONTH_RE}\s+(\d{{1,2}})[,\s]+(\d{{4}})",
+    # OCR sometimes glues the day digit onto the END of the month token
+    # instead of before it (e.g. "4th Oct" misread as "Oct4 ...") — this
+    # pattern recovers that specific shape, still anchored on an
+    # unambiguous month name.
+    rf"{MONTH_RE}\s*(\d{{1,2}})\D{{0,5}}(\d{{3,4}})",
+    # Pure-numeric dates (28/10/2026 style) are the risky case — a 10-digit
+    # index number fragment can look like one, so these get a calendar
+    # sanity check below before being accepted.
+    r"(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})",
+]
+
+def _fix_ocr_year(y: str) -> int | None:
+    """
+    OCR sometimes mangles one digit of a 4-digit year (e.g. "2026" ->
+    "3026"). Since attendance sheets only ever carry a handful of plausible
+    academic years, we correct a single wrong leading/trailing digit against
+    the current year rather than rejecting the whole date outright.
+    """
+    try:
+        y_int = int(y)
+    except (ValueError, TypeError):
+        return None
+    if len(str(y)) == 3:
+        y_int += 2000 if y_int < 100 else 0
+    current_year = datetime.now().year
+    # Already plausible as-is
+    if abs(y_int - current_year) <= 2:
+        return y_int
+    # Try swapping each digit for "2" (the near-universal century/decade
+    # digit for any sheet dated in the 2020s) and see if that lands
+    # within range of the current year — recovers "3026" -> "2026".
+    y_str = str(y_int).zfill(4)
+    for i in range(len(y_str)):
+        candidate = int(y_str[:i] + "2" + y_str[i+1:])
+        if abs(candidate - current_year) <= 2:
+            return candidate
+    return None
+
+def _is_plausible_calendar_date(d, m, y):
+    """Reject anything that can't be a real date — this is what stops a
+    mangled index-number fragment like '64.02.266' from being accepted as
+    a day/month/year."""
+    try:
+        d, m = int(d), int(m)
+        y_fixed = _fix_ocr_year(y)
+        if y_fixed is None:
+            return False
+        if not (1 <= d <= 31 and 1 <= m <= 12):
+            return False
+        datetime(y_fixed, m, d)  # raises if the day doesn't exist for that month
+        return True
+    except (ValueError, TypeError):
+        return False
+
 def extract_date_from_text(text):
-    """Extract a date string from OCR text."""
-    patterns = [
-        r"(\d{1,2})[\/\-\.](\d{1,2})[\/\-\.](\d{2,4})",
-        r"(\d{1,2})\s*(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*[,\s]+(\d{4})",
-        r"(Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+(\d{1,2})[,\s]+(\d{4})",
-        r"(\d{1,2})\s*(Oct|Nov|Dec|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep)[a-z]*\.?\s*,?\s*(\d{4})",
-    ]
-    for p in patterns:
-        m = re.search(p, text, re.IGNORECASE)
-        if m:
-            return m.group(0).strip()
+    """
+    Extract the attendance date from OCR text.
+
+    Per the sheet's own layout, the date is written right after the literal
+    label "DATE" on the "START TIME ... FINISH TIME ... DATE ..." line — so
+    we search THAT substring first, ignoring the fixed university/
+    department boilerplate header and the student rows entirely (neither
+    can contain a real date). Only if no "DATE"-anchored match is found do
+    we fall back to scanning the whole text, and even then every numeric
+    (non-month-name) candidate must pass a real calendar-date sanity check
+    before being accepted — this is what rejects index-number fragments
+    like "64.02.266" or "252640**2.266" that LOOK like a date but aren't.
+    """
+    MONTH_NUM = {"JAN":1,"FEB":2,"MAR":3,"APR":4,"MAY":5,"JUN":6,
+                 "JUL":7,"AUG":8,"SEP":9,"OCT":10,"NOV":11,"DEC":12,
+                 # Common OCR letter-swap variants on handwritten cursive
+                 # (matches the MONTH_RE alternation above)
+                 "MAJ":5, "OCK":10, "DES":12}
+
+    def _build_clean_date(groups):
+        """Turn a regex match's groups into a clean 'DD Mon YYYY' string,
+        correcting the year if OCR mangled a digit. Returns None if the
+        groups don't resolve to a real date."""
+        # Figure out which group is the month name (if any)
+        month_name = next((g for g in groups if g and g[:3].isalpha()), None)
+        numeric_groups = [g for g in groups if g and g.isdigit()]
+
+        if month_name:
+            mon = MONTH_NUM.get(month_name[:3].upper())
+            if mon is None or len(numeric_groups) < 2:
+                return None
+            day_str, year_str = numeric_groups[0], numeric_groups[-1]
+            try:
+                day = int(day_str)
+            except ValueError:
+                return None
+            y_fixed = _fix_ocr_year(year_str)
+            if y_fixed is None or not (1 <= day <= 31):
+                return None
+            try:
+                datetime(y_fixed, mon, day)
+            except ValueError:
+                return None
+            return f"{day:02d} {list(MONTH_NUM.keys())[mon-1].title()} {y_fixed}"
+        else:
+            if len(groups) != 3:
+                return None
+            d, mo, y = groups
+            if not _is_plausible_calendar_date(d, mo, y):
+                return None
+            y_fixed = _fix_ocr_year(y)
+            return f"{int(d):02d}/{int(mo):02d}/{y_fixed}"
+
+    # ── Stage 1: anchor on the "DATE" label on the sheet ────────────────
+    # Tolerant of OCR misreads of the label itself (e.g. "DATH" instead of
+    # "DATE" — confirmed from a real run) by allowing the last letter to be
+    # any single character rather than requiring an exact "DATE" match.
+    date_label_match = re.search(r"DAT[EH]\.{0,5}\s*[:.]?\s*(.{3,25})", text, re.IGNORECASE)
+    if date_label_match:
+        window = date_label_match.group(1)
+        for p in _DATE_PATTERNS:
+            m = re.search(p, window, re.IGNORECASE)
+            if m:
+                clean = _build_clean_date(m.groups())
+                if clean:
+                    return clean
+
+    # ── Stage 2: fallback — scan everything, but numeric hits still need
+    #             to pass the calendar sanity check ─────────────────────
+    for p in _DATE_PATTERNS:
+        for m in re.finditer(p, text, re.IGNORECASE):
+            clean = _build_clean_date(m.groups())
+            if clean:
+                return clean
+
+    # ── Stage 3: month+year only, no recoverable day digit ──────────────
+    # Some handwriting completely destroys the day number into letters
+    # ("4th" -> "Ath"/"Ith" with zero actual digits anywhere nearby) — there
+    # is genuinely no digit left to extract. Rather than silently using
+    # today's date with no explanation, report just the month/year so the
+    # caller can warn the user specifically that the DAY needs manual
+    # confirmation, instead of pretending full confidence.
+    search_window = date_label_match.group(1) if date_label_match else text
+    m = re.search(MONTH_RE + r"\.?\s*,?\s*(\d{3,4})", search_window, re.IGNORECASE)
+    if m:
+        month_name, year_str = m.group(1), m.group(2)
+        mon = MONTH_NUM.get(month_name[:3].upper())
+        y_fixed = _fix_ocr_year(year_str)
+        if mon and y_fixed:
+            return f"?? {list(MONTH_NUM.keys())[mon-1].title()} {y_fixed} (day illegible — confirm manually)"
+
     return None
 
 def is_likely_name(text):
@@ -210,6 +506,18 @@ def is_likely_name(text):
     if len(text) < 2:
         return False
     if HEADER_NOISE.search(text):
+        return False
+    # A real handwritten name never contains underscores, brackets, plus
+    # signs, pipes, etc. — these only show up when Tesseract mashes an
+    # entire jumbled table row (name + index + sign column) into one run-on
+    # string, e.g. "olAmark Aayye  __ifasactoz3e+ [he". Reject outright
+    # rather than let the roster fuzzy-matcher try to make sense of it.
+    if re.search(r"[_+\[\]{}|<>=~^@#$%&*]", text):
+        return False
+    # A single table row's name is realistically well under 30 characters;
+    # anything longer is almost certainly multiple columns/rows glued
+    # together by a failed table-structure read.
+    if len(text) > 30:
         return False
     words = text.split()
     if not (1 <= len(words) <= 6):
@@ -318,6 +626,189 @@ def parse_student_names_from_results(results):
 
 # ── Playwright automation ──────────────────────────────────────────────────
 
+def select_course_on_page(page, course_code, emit):
+    """
+    Robustly select `course_code` on the attendance page's course control.
+
+    Handles three common UI shapes, in order, and logs exactly what it
+    tried and found so a failure is diagnosable instead of silent:
+      1. A native <select> element containing the course as an <option>.
+      2. A custom (div/button-based) dropdown that reveals a list of
+         option-like elements on click.
+      3. A simple text/search input the course can be typed into.
+
+    Returns True if a selection was made and visually confirmed, False
+    otherwise (and always emits a clear reason why).
+    """
+    code_upper = course_code.upper().strip()
+
+    # Build loose match targets: "ENCE 241" and "ENCE241" both acceptable,
+    # since portals vary in whether they keep the space.
+    code_compact = code_upper.replace(" ", "")
+
+    def text_matches(txt):
+        if not txt:
+            return False
+        t = txt.upper()
+        return code_upper in t or code_compact in t.replace(" ", "")
+
+    # ── Attempt 1: native <select> ──────────────────────────────
+    try:
+        selects = page.locator("select").all()
+        emit(f"🔎 Found {len(selects)} native <select> element(s) on the page.")
+        for idx, sel in enumerate(selects):
+            try:
+                options = sel.locator("option").all_inner_texts()
+            except Exception:
+                options = []
+            emit(f"   select[{idx}] options sample: {options[:8]}")
+            matching = [o for o in options if text_matches(o)]
+            if matching:
+                sel.select_option(label=matching[0])
+                emit(f"✅ Course {course_code} selected via <select> (matched option '{matching[0]}').")
+                return True
+    except Exception as e:
+        emit(f"⚠️ Native <select> course check failed: {e}", "warn")
+
+    # ── Attempt 2: custom dropdown (div/button that reveals a list) ──
+    try:
+        dropdown_candidates = page.locator(
+            "[class*='dropdown'], [class*='select'], [class*='combobox'], "
+            "[role='combobox'], [role='listbox'], button:has-text('Course'), "
+            "button:has-text('course')"
+        ).all()
+        emit(f"🔎 Found {len(dropdown_candidates)} custom dropdown-like element(s).")
+        for dd in dropdown_candidates:
+            try:
+                if not dd.is_visible():
+                    continue
+                txt = dd.inner_text()
+            except Exception:
+                continue
+            # Only click controls that look course-related (avoid clicking
+            # an unrelated dropdown, e.g. a status filter).
+            if not any(k in txt.upper() for k in ["COURSE", "ENEE", "ENCE", "MATH", "PHY", "SELECT"]):
+                continue
+            dd.click()
+            time.sleep(0.5)
+            option = page.locator(
+                f"li:has-text('{course_code}'), option:has-text('{course_code}'), "
+                f"[role='option']:has-text('{course_code}'), div:has-text('{course_code}')"
+            ).first
+            try:
+                if option.is_visible(timeout=1500):
+                    option.click()
+                    emit(f"✅ Course {course_code} selected via custom dropdown.")
+                    return True
+                else:
+                    emit(f"⚠️ Opened a dropdown but no visible option matched '{course_code}'.", "warn")
+            except Exception:
+                emit(f"⚠️ Opened a dropdown but could not locate option '{course_code}'.", "warn")
+    except Exception as e:
+        emit(f"⚠️ Custom dropdown course check failed: {e}", "warn")
+
+    # ── Attempt 3: plain text/search input ──────────────────────
+    try:
+        text_inputs = page.locator(
+            "input[placeholder*='course' i], input[placeholder*='Course' i], input[name*='course' i]"
+        ).all()
+        if text_inputs:
+            text_inputs[0].fill(course_code)
+            time.sleep(0.3)
+            option = page.locator(f"li:has-text('{course_code}'), [role='option']:has-text('{course_code}')").first
+            if option.is_visible(timeout=1500):
+                option.click()
+                emit(f"✅ Course {course_code} selected via text input + suggestion.")
+                return True
+    except Exception as e:
+        emit(f"⚠️ Text-input course check failed: {e}", "warn")
+
+    emit(f"❌ Could not auto-select course '{course_code}' — no matching control found. "
+         f"Please select it manually on the page.", "warn")
+    return False
+
+
+def set_date_on_page(page, date_str, emit):
+    """
+    Robustly set the attendance date on the page.
+
+    Handles native <input type="date"> as well as common custom
+    date-picker patterns (a plain text input that accepts typed dates,
+    or a button that opens a calendar widget). Logs what it tried.
+
+    Returns True if a date was set and (where verifiable) confirmed in
+    the input's value, False otherwise — never fails silently.
+    """
+    parsed = None
+    for fmt in ["%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d %b %Y", "%B %d, %Y", "%Y-%m-%d"]:
+        try:
+            parsed = datetime.strptime(date_str, fmt)
+            break
+        except Exception:
+            pass
+
+    if not parsed:
+        emit(f"⚠️ Could not parse '{date_str}' into a real date — please set it manually.", "warn")
+        return False
+
+    iso = parsed.strftime("%Y-%m-%d")
+
+    # ── Attempt 1: native <input type="date"> ───────────────────
+    try:
+        date_inputs = page.locator("input[type='date']").all()
+        emit(f"🔎 Found {len(date_inputs)} native date input(s).")
+        if date_inputs:
+            di = date_inputs[0]
+            di.fill(iso)
+            actual = di.input_value()
+            if actual == iso:
+                emit(f"✅ Date set to {iso} (confirmed in field).")
+                return True
+            else:
+                emit(f"⚠️ Set date field but value reads back as '{actual}', not '{iso}'.", "warn")
+    except Exception as e:
+        emit(f"⚠️ Native date input check failed: {e}", "warn")
+
+    # ── Attempt 2: text input that accepts a typed date ─────────
+    try:
+        text_date_inputs = page.locator(
+            "input[placeholder*='date' i], input[name*='date' i], input[class*='date' i]"
+        ).all()
+        emit(f"🔎 Found {len(text_date_inputs)} text-style date input(s).")
+        for di in text_date_inputs:
+            try:
+                if not di.is_visible():
+                    continue
+            except Exception:
+                continue
+            # Try a few common display formats, since custom pickers often
+            # reject ISO and expect their own.
+            for candidate in [parsed.strftime("%d/%m/%Y"), iso, parsed.strftime("%m/%d/%Y")]:
+                di.fill(candidate)
+                actual = di.input_value()
+                if actual and actual.strip():
+                    emit(f"✅ Date field filled with '{candidate}' (reads back as '{actual}').")
+                    return True
+    except Exception as e:
+        emit(f"⚠️ Text-style date input check failed: {e}", "warn")
+
+    # ── Attempt 3: a button/control that opens a calendar widget ─
+    try:
+        calendar_triggers = page.locator(
+            "button[class*='date' i], button[class*='calendar' i], [class*='datepicker' i]"
+        ).all()
+        emit(f"🔎 Found {len(calendar_triggers)} calendar-widget trigger(s).")
+        if calendar_triggers:
+            emit("⚠️ A calendar-widget date picker was detected, but clicking through "
+                 "day/month/year cells isn't automated yet — please set the date manually.", "warn")
+    except Exception as e:
+        emit(f"⚠️ Calendar-widget date check failed: {e}", "warn")
+
+    emit(f"❌ Could not auto-set date '{date_str}' — no matching control found. "
+         f"Please set it manually on the page.", "warn")
+    return False
+
+
 def run_automation(credentials, image_path, manual_course=None, manual_date=None, mode="auto"):
     """Main automation coroutine — runs in background thread."""
     STATE["status"] = "running"
@@ -330,6 +821,18 @@ def run_automation(credentials, image_path, manual_course=None, manual_date=None
         emit("📄 Reading attendance sheet with EasyOCR (handwriting model)…")
         raw_text, ocr_results = ocr_image_easyocr(image_path)
         emit(f"📝 EasyOCR full text:\n{raw_text[:800]}")
+
+        # ── Step 1a: TrOCR rescue — re-read low-confidence EasyOCR lines ──
+        # Any EasyOCR bbox whose confidence is below TROCR_CONFIDENCE_THRESHOLD
+        # gets cropped and re-run through TrOCR's handwriting-specific model.
+        # This replaces the weak EasyOCR reading in-place, so the rest of
+        # the pipeline (column detection, roster matching) sees the better text
+        # without knowing which engine produced it.
+        emit("🔄 Running TrOCR rescue pass on low-confidence EasyOCR lines…")
+        preprocessed_np = preprocess_image(image_path)  # reuse the same enhanced image
+        ocr_results = trocr_rescore_low_confidence_lines(preprocessed_np, ocr_results)
+        # Rebuild raw_text from the (possibly upgraded) results
+        raw_text = "\n".join(r["text"] for r in ocr_results if r["text"].strip())
 
         tesseract_lines = ocr_image_tesseract(image_path)
         # Tesseract output has no bbox, so it can't participate in the
@@ -480,51 +983,15 @@ def run_automation(credentials, image_path, manual_course=None, manual_date=None
         # ── Step 5: Select course if auto-detected ─────────────────
         if course_code:
             emit(f"🔍 Selecting course: {course_code}…")
-            try:
-                # Open the course dropdown
-                course_dropdown = page.locator("select, [class*='course'], button:has-text('ENEE'), button:has-text('ENCE'), button:has-text('MATH'), button:has-text('PHY')").first
-                # Try select element first
-                selects = page.locator("select").all()
-                for sel in selects:
-                    options_text = sel.inner_text()
-                    if any(c in options_text.upper() for c in ["ENEE", "ENCE", "MATH", "PHY"]):
-                        sel.select_option(label=lambda l: course_code in l.upper() if l else False)
-                        break
-                # Also try clicking dropdown button
-                dropdowns = page.locator("[class*='dropdown'], [class*='select']").all()
-                for dd in dropdowns:
-                    txt = dd.inner_text()
-                    if "ENEE" in txt.upper() or "ENCE" in txt.upper() or "COURSE" in txt.upper():
-                        dd.click()
-                        time.sleep(0.5)
-                        # Click the matching option
-                        option = page.locator(f"li:has-text('{course_code}'), option:has-text('{course_code}'), [role='option']:has-text('{course_code}')").first
-                        if option.is_visible():
-                            option.click()
-                            emit(f"✅ Course {course_code} selected.")
-                        break
-            except Exception as e:
-                emit(f"⚠️ Auto-select course failed ({e}). Please select manually in the browser.", "warn")
+            select_course_on_page(page, course_code, emit)
 
         # Select date if detected
-        if date_str:
+        if date_str and "illegible" in date_str:
+            emit(f"⚠️ Could only read the month/year ({date_str}) — the day digit was fully "
+                 f"obscured by handwriting. Please set the correct date manually on the page.", "warn")
+        elif date_str:
             emit(f"📅 Attempting to set date: {date_str}…")
-            try:
-                date_inputs = page.locator("input[type='date']").all()
-                for di in date_inputs:
-                    # Try to parse and format the date
-                    parsed = None
-                    for fmt in ["%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d %b %Y", "%B %d, %Y"]:
-                        try:
-                            parsed = datetime.strptime(date_str, fmt)
-                            break
-                        except:
-                            pass
-                    if parsed:
-                        di.fill(parsed.strftime("%Y-%m-%d"))
-                        emit(f"✅ Date set to {parsed.strftime('%Y-%m-%d')}")
-            except Exception as e:
-                emit(f"⚠️ Auto-set date failed ({e}). Please set manually in the browser.", "warn")
+            set_date_on_page(page, date_str, emit)
 
         # Click Filter button
         try:
@@ -537,21 +1004,57 @@ def run_automation(credentials, image_path, manual_course=None, manual_date=None
             pass
 
         # ── Step 6: Mark each student via Manual Override ──────────
+        # The real modal (confirmed from the page's own HTML) is a single
+        # element that always exists in the DOM and is toggled by removing/
+        # adding the "hidden" Tailwind class — it is NOT destroyed and
+        # recreated per open. That's why a modal left open by a prior failed
+        # attempt can sit on top of the page (z-50, full-screen backdrop)
+        # and silently block every click on the next iteration. We force it
+        # closed before every single attempt, not just after failures.
+        MODAL_SELECTOR = "#manual-override-modal"
+
+        def force_close_modal(page):
+            """Guarantee the modal is hidden before we try to open it again."""
+            try:
+                page.evaluate(
+                    "document.getElementById('manual-override-modal')"
+                    "?.classList.add('hidden')"
+                )
+            except Exception:
+                pass
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+            time.sleep(0.3)
+
         marked = 0
         failed = []
 
         for idx, name in enumerate(student_names, 1):
             emit(f"[{idx}/{len(student_names)}] Marking: {name}…")
+
+            # Always start from a known-closed state — this is the fix for
+            # the "subtree intercepts pointer events" failure: a modal stuck
+            # open from a previous timeout/error no longer blocks this turn.
+            force_close_modal(page)
+
             try:
-                # Click the + Manual button
+                # Click the + Manual button (opens the modal by removing
+                # the "hidden" class on #manual-override-modal)
                 manual_btn = page.locator("button:has-text('MANUAL'), button:has-text('Manual'), a:has-text('Manual')").first
                 manual_btn.wait_for(state="visible", timeout=8000)
-                manual_btn.click()
-                time.sleep(0.8)
+                manual_btn.click(timeout=5000)
 
-                # Wait for the Modal to appear
-                modal = page.locator("[role='dialog'], .modal, [class*='modal'], [class*='overlay']").first
-                modal.wait_for(state="visible", timeout=8000)
+                # Wait for the actual modal element to lose "hidden" —
+                # more reliable than a generic visibility check, since the
+                # element technically exists in the DOM the whole time.
+                modal = page.locator(MODAL_SELECTOR)
+                page.wait_for_function(
+                    "() => { const m = document.getElementById('manual-override-modal');"
+                    " return m && !m.classList.contains('hidden'); }",
+                    timeout=8000,
+                )
 
                 # Clear search and type student name
                 search_input = modal.locator("input[type='text'], input[type='search'], input").first
@@ -559,8 +1062,9 @@ def run_automation(credentials, image_path, manual_course=None, manual_date=None
                 search_input.fill(name)
                 time.sleep(1.2)  # wait for search results
 
-                # Look for the student in results
-                # Try to find a checkbox or list item matching the name
+                # Look for the student in results — the checkbox + label
+                # structure confirmed from the "Manual System Override"
+                # screenshot: each result row has its own checkbox input.
                 result_items = modal.locator("[class*='result'], li, label, [class*='student']").all()
                 found = False
 
@@ -568,13 +1072,12 @@ def run_automation(credentials, image_path, manual_course=None, manual_date=None
                 for item in result_items:
                     item_text = item.inner_text().upper().strip()
                     if name in item_text or all(word in item_text for word in name.split() if len(word) > 2):
-                        # Make sure checkbox is checked (blue)
                         cb = item.locator("input[type='checkbox']")
                         if cb.count() > 0:
                             if not cb.is_checked():
-                                cb.check()
+                                cb.check(timeout=3000)
                         else:
-                            item.click()
+                            item.click(timeout=3000)
                         emit(f"  ✓ Found and ticked: {item_text[:60]}")
                         found = True
                         break
@@ -585,11 +1088,10 @@ def run_automation(credentials, image_path, manual_course=None, manual_date=None
                     if first_cb.count() > 0 and first_cb.is_visible():
                         result_label = modal.locator("label, [class*='name'], p").first
                         result_text  = result_label.inner_text().upper() if result_label.count() > 0 else ""
-                        # Only tick if at least one word matches
                         name_words = [w for w in name.split() if len(w) > 2]
                         if any(w in result_text for w in name_words):
                             if not first_cb.is_checked():
-                                first_cb.check()
+                                first_cb.check(timeout=3000)
                             emit(f"  ✓ Ticked first result: {result_text[:60]}")
                             found = True
 
@@ -608,26 +1110,34 @@ def run_automation(credentials, image_path, manual_course=None, manual_date=None
                         cb = best_item.locator("input[type='checkbox']")
                         if cb.count() > 0:
                             if not cb.is_checked():
-                                cb.check()
+                                cb.check(timeout=3000)
                         else:
-                            best_item.click()
+                            best_item.click(timeout=3000)
                         emit(f"  ✓ Fuzzy-matched ({best_score:.0%}): '{name}' → '{best_text[:50]}'", "warn")
                         found = True
+
+                # Confirm the checkbox is actually checked before verifying —
+                # directly matches your instruction to count only confirmed
+                # (blue/checked) boxes, not just "we clicked something".
+                if found:
+                    checked_box = modal.locator("input[type='checkbox']:checked").first
+                    if checked_box.count() == 0:
+                        emit(f"  ⚠️ Clicked a result for '{name}' but checkbox isn't confirmed checked — treating as not found.", "warn")
+                        found = False
 
                 if not found:
                     emit(f"  ⚠️ Could not find '{name}' in results — skipping.", "warn")
                     failed.append(name)
-                    # Close modal
                     cancel = modal.locator("button:has-text('CANCEL'), button:has-text('Cancel')").first
                     if cancel.is_visible():
-                        cancel.click()
-                    time.sleep(0.5)
+                        cancel.click(timeout=3000)
+                    force_close_modal(page)
                     continue
 
                 # Click Verify Selection
                 verify_btn = modal.locator("button:has-text('VERIFY'), button:has-text('Verify')").first
                 verify_btn.wait_for(state="visible", timeout=5000)
-                verify_btn.click()
+                verify_btn.click(timeout=5000)
                 time.sleep(1.0)
 
                 # Wait for success toast/notification
@@ -636,32 +1146,26 @@ def run_automation(credentials, image_path, manual_course=None, manual_date=None
                     emit(f"  🟢 Confirmed present: {name}")
                     marked += 1
                     STATE["counts"]["marked"] = marked
-                except:
-                    # Toast might not match exactly; assume success if no error
+                except Exception:
                     emit(f"  🟡 Submitted (no confirmation toast detected) — {name}")
                     marked += 1
                     STATE["counts"]["marked"] = marked
 
+                # Make sure the modal is actually gone before looping —
+                # this is what used to leave it stuck open for the NEXT
+                # student's attempt.
+                force_close_modal(page)
                 time.sleep(0.5)
 
             except PlaywrightTimeout as e:
                 emit(f"  ❌ Timeout for '{name}': {e}", "error")
                 failed.append(name)
-                # Try to close any open modal
-                try:
-                    page.keyboard.press("Escape")
-                    time.sleep(0.3)
-                except:
-                    pass
+                force_close_modal(page)
 
             except Exception as e:
                 emit(f"  ❌ Error for '{name}': {e}", "error")
                 failed.append(name)
-                try:
-                    page.keyboard.press("Escape")
-                    time.sleep(0.3)
-                except:
-                    pass
+                force_close_modal(page)
 
         # ── Done ───────────────────────────────────────────────────
         # "failed" in the UI's red "Not Found" tray should show every name
