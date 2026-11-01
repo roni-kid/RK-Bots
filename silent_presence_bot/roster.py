@@ -100,6 +100,36 @@ def _best_token_alignment(query_tokens: list, name_tokens: list) -> float:
     return weighted_sum / total_weight if total_weight else 0.0
 
 
+def token_order_similarity(a: str, b: str) -> float:
+    """
+    0.0–1.0 similarity between two names that is tolerant of WORD ORDER,
+    for comparing two already-OCR'd/typed name strings (as opposed to
+    _best_full_match, which compares one OCR fragment against the whole
+    roster). Portal search results and attendance-sheet handwriting
+    frequently order names differently — "Aaron Andoh Dadson Baidoo" vs
+    "Baidoo Aaron Dadson Andoh" are the same person, but a plain
+    SequenceMatcher on the raw strings scores that very low because it's
+    comparing character runs, not word identity.
+
+    Blends:
+      1. Full-string sequence similarity (catches minor letter noise when
+         order happens to already match)
+      2. Per-token best-alignment similarity (catches reordering and
+         letter-level noise within individual words)
+    token-alignment is weighted higher since word reordering is the
+    dominant real-world failure mode here.
+    """
+    a_norm = re.sub(r"[^A-Z0-9 ]", "", a.upper()).strip()
+    b_norm = re.sub(r"[^A-Z0-9 ]", "", b.upper()).strip()
+    a_tokens = a_norm.split()
+    b_tokens = b_norm.split()
+
+    seq_score = SequenceMatcher(None, a_norm, b_norm).ratio()
+    token_score = _best_token_alignment(a_tokens, b_tokens)
+
+    return (0.4 * seq_score) + (0.6 * token_score)
+
+
 def _best_full_match(query: str, roster: list):
     """
     Score every roster entry against the OCR query using a BLEND of:

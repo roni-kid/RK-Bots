@@ -8,12 +8,13 @@ import os, sys, re, json, time, base64, threading, logging
 from pathlib import Path
 from datetime import datetime
 from io import BytesIO
+from urllib.parse import urlparse, parse_qsl, urlencode
 from flask import Flask, render_template_string, request, jsonify, send_from_directory
 from PIL import Image, ImageFilter, ImageEnhance
 import numpy as np
 from difflib import SequenceMatcher
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeout
-from roster import load_roster, match_all_ocr_fragments
+from roster import load_roster, match_all_ocr_fragments, token_order_similarity
 
 try:
     import pytesseract
@@ -22,8 +23,13 @@ except ImportError:
     _TESSERACT_AVAILABLE = False
 
 def name_similarity(a, b):
-    """0.0–1.0 similarity between two names, tolerant of OCR noise."""
-    return SequenceMatcher(None, a.upper().strip(), b.upper().strip()).ratio()
+    """
+    0.0–1.0 similarity between two names, tolerant of OCR noise AND word
+    order (surname-first vs surname-last, or any other shuffled order —
+    the portal's own display order frequently differs from how a name was
+    handwritten on the sheet, or from how the roster stores it).
+    """
+    return token_order_similarity(a, b)
 
 # ── EasyOCR loader (lazy — downloaded once on first use) ───────────────────
 _easyocr_reader = None
@@ -628,22 +634,20 @@ def parse_student_names_from_results(results):
 
 def select_course_on_page(page, course_code, emit):
     """
-    Robustly select `course_code` on the attendance page's course control.
+    Select `course_code` in the attendance page's course filter.
 
-    Handles three common UI shapes, in order, and logs exactly what it
-    tried and found so a failure is diagnosable instead of silent:
-      1. A native <select> element containing the course as an <option>.
-      2. A custom (div/button-based) dropdown that reveals a list of
-         option-like elements on click.
-      3. A simple text/search input the course can be typed into.
+    Confirmed from the real page source (not guessed): the control is a
+    genuine native <select name="lecture_id" onchange="this.form.submit()">
+    inside the filter <form method="GET">. Each <option>'s visible text is
+    the full course line, e.g. "ENCE 243 - OPERATING SYSTEMS". Because of
+    the onchange handler, calling Playwright's select_option() on it
+    submits the form automatically — no separate click or FILTER button
+    press is needed or wanted; doing both would double-submit.
 
-    Returns True if a selection was made and visually confirmed, False
-    otherwise (and always emits a clear reason why).
+    Returns True once the option is selected and the resulting page
+    navigation (the form's GET submit) has completed.
     """
     code_upper = course_code.upper().strip()
-
-    # Build loose match targets: "ENCE 241" and "ENCE241" both acceptable,
-    # since portals vary in whether they keep the space.
     code_compact = code_upper.replace(" ", "")
 
     def text_matches(txt):
@@ -652,92 +656,51 @@ def select_course_on_page(page, course_code, emit):
         t = txt.upper()
         return code_upper in t or code_compact in t.replace(" ", "")
 
-    # ── Attempt 1: native <select> ──────────────────────────────
     try:
-        selects = page.locator("select").all()
-        emit(f"🔎 Found {len(selects)} native <select> element(s) on the page.")
-        for idx, sel in enumerate(selects):
-            try:
-                options = sel.locator("option").all_inner_texts()
-            except Exception:
-                options = []
-            emit(f"   select[{idx}] options sample: {options[:8]}")
-            matching = [o for o in options if text_matches(o)]
-            if matching:
-                sel.select_option(label=matching[0])
-                emit(f"✅ Course {course_code} selected via <select> (matched option '{matching[0]}').")
-                return True
-    except Exception as e:
-        emit(f"⚠️ Native <select> course check failed: {e}", "warn")
+        select_el = page.locator("select[name='lecture_id']").first
+        if select_el.count() == 0:
+            emit("❌ Could not find the course <select name='lecture_id'> on this page — "
+                 "the portal's markup may have changed. Please select it manually.", "warn")
+            return False
 
-    # ── Attempt 2: custom dropdown (div/button that reveals a list) ──
-    try:
-        dropdown_candidates = page.locator(
-            "[class*='dropdown'], [class*='select'], [class*='combobox'], "
-            "[role='combobox'], [role='listbox'], button:has-text('Course'), "
-            "button:has-text('course')"
-        ).all()
-        emit(f"🔎 Found {len(dropdown_candidates)} custom dropdown-like element(s).")
-        for dd in dropdown_candidates:
-            try:
-                if not dd.is_visible():
-                    continue
-                txt = dd.inner_text()
-            except Exception:
-                continue
-            # Only click controls that look course-related (avoid clicking
-            # an unrelated dropdown, e.g. a status filter).
-            if not any(k in txt.upper() for k in ["COURSE", "ENEE", "ENCE", "MATH", "PHY", "SELECT"]):
-                continue
-            dd.click()
-            time.sleep(0.5)
-            option = page.locator(
-                f"li:has-text('{course_code}'), option:has-text('{course_code}'), "
-                f"[role='option']:has-text('{course_code}'), div:has-text('{course_code}')"
-            ).first
-            try:
-                if option.is_visible(timeout=1500):
-                    option.click()
-                    emit(f"✅ Course {course_code} selected via custom dropdown.")
-                    return True
-                else:
-                    emit(f"⚠️ Opened a dropdown but no visible option matched '{course_code}'.", "warn")
-            except Exception:
-                emit(f"⚠️ Opened a dropdown but could not locate option '{course_code}'.", "warn")
-    except Exception as e:
-        emit(f"⚠️ Custom dropdown course check failed: {e}", "warn")
+        options = select_el.locator("option").all_inner_texts()
+        emit(f"🔎 Course dropdown options: {options}")
+        matching = [o for o in options if text_matches(o)]
+        if not matching:
+            emit(f"❌ No course option matched '{course_code}' among {options}. "
+                 f"Please select it manually.", "warn")
+            return False
 
-    # ── Attempt 3: plain text/search input ──────────────────────
-    try:
-        text_inputs = page.locator(
-            "input[placeholder*='course' i], input[placeholder*='Course' i], input[name*='course' i]"
-        ).all()
-        if text_inputs:
-            text_inputs[0].fill(course_code)
-            time.sleep(0.3)
-            option = page.locator(f"li:has-text('{course_code}'), [role='option']:has-text('{course_code}')").first
-            if option.is_visible(timeout=1500):
-                option.click()
-                emit(f"✅ Course {course_code} selected via text input + suggestion.")
-                return True
+        # select_option's onchange triggers this.form.submit(), which
+        # navigates the page (GET) — wait for that navigation so the
+        # caller doesn't proceed before the new course's page has loaded.
+        with page.expect_navigation(wait_until="load", timeout=20000):
+            select_el.select_option(label=matching[0])
+        emit(f"✅ Course set to '{matching[0]}'.")
+        return True
     except Exception as e:
-        emit(f"⚠️ Text-input course check failed: {e}", "warn")
-
-    emit(f"❌ Could not auto-select course '{course_code}' — no matching control found. "
-         f"Please select it manually on the page.", "warn")
-    return False
+        emit(f"⚠️ Course selection failed: {e}", "warn")
+        return False
 
 
 def set_date_on_page(page, date_str, emit):
     """
-    Robustly set the attendance date on the page.
+    Select the target date in the attendance page's date filter.
 
-    Handles native <input type="date"> as well as common custom
-    date-picker patterns (a plain text input that accepts typed dates,
-    or a button that opens a calendar widget). Logs what it tried.
-
-    Returns True if a date was set and (where verifiable) confirmed in
-    the input's value, False otherwise — never fails silently.
+    Confirmed from the real page source: the control is a native
+    <select name="date" onchange="this.form.submit()">, same pattern as
+    the course dropdown. However — important and worth flagging rather
+    than silently assuming otherwise — the markup we were given shows
+    this <select> populated with only ONE <option>, matching whatever
+    date is currently active for the selected course; it is not a full
+    calendar or a list of every lecture date. If that holds generally,
+    the only way to reach an earlier date is a date actually present as
+    an option (e.g. once a given course is selected, its own session
+    dates may populate here) or via the page's URL query string
+    (?date=YYYY-MM-DD) directly. This function handles both: it first
+    tries to find and select a matching <option> if one exists, and
+    falls back to navigating with a `date` query parameter appended to
+    the current URL if no matching option is present.
     """
     parsed = None
     for fmt in ["%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d %b %Y", "%B %d, %Y", "%Y-%m-%d"]:
@@ -753,61 +716,52 @@ def set_date_on_page(page, date_str, emit):
 
     iso = parsed.strftime("%Y-%m-%d")
 
-    # ── Attempt 1: native <input type="date"> ───────────────────
     try:
-        date_inputs = page.locator("input[type='date']").all()
-        emit(f"🔎 Found {len(date_inputs)} native date input(s).")
-        if date_inputs:
-            di = date_inputs[0]
-            di.fill(iso)
-            actual = di.input_value()
-            if actual == iso:
-                emit(f"✅ Date set to {iso} (confirmed in field).")
+        select_el = page.locator("select[name='date']").first
+        if select_el.count() == 0:
+            emit("❌ Could not find the date <select name='date'> on this page — "
+                 "please set it manually.", "warn")
+            return False
+
+        option_values = select_el.locator("option").evaluate_all(
+            "els => els.map(e => e.value)"
+        )
+        option_texts = select_el.locator("option").all_inner_texts()
+        emit(f"🔎 Date dropdown options: {list(zip(option_values, option_texts))}")
+
+        if iso in option_values:
+            with page.expect_navigation(wait_until="load", timeout=20000):
+                select_el.select_option(value=iso)
+            emit(f"✅ Date set to {iso} via the date dropdown.")
+            return True
+
+        # No matching <option> — the dropdown may only ever contain the
+        # currently active date. Fall back to driving the URL directly,
+        # since the filter form is a GET with named fields (lecture_id,
+        # date) that map straight onto query parameters.
+        emit(f"⚠️ {iso} isn't an available option in the date dropdown "
+             f"(found: {option_texts}) — trying the URL's date parameter instead.", "warn")
+        current_url = page.url
+        parsed_url = urlparse(current_url)
+        query = dict(parse_qsl(parsed_url.query))
+        query["date"] = iso
+        new_url = parsed_url._replace(query=urlencode(query)).geturl()
+        with page.expect_navigation(wait_until="load", timeout=20000):
+            page.goto(new_url)
+
+        # Confirm it actually took — re-read the (now reloaded) date select.
+        select_el = page.locator("select[name='date']").first
+        if select_el.count() > 0:
+            new_values = select_el.locator("option").evaluate_all("els => els.map(e => e.value)")
+            if iso in new_values:
+                emit(f"✅ Date set to {iso} via URL parameter (confirmed in the reloaded dropdown).")
                 return True
-            else:
-                emit(f"⚠️ Set date field but value reads back as '{actual}', not '{iso}'.", "warn")
+        emit(f"⚠️ Tried setting the date via URL parameter, but couldn't confirm {iso} took effect — "
+             f"please check and set it manually if needed.", "warn")
+        return False
     except Exception as e:
-        emit(f"⚠️ Native date input check failed: {e}", "warn")
-
-    # ── Attempt 2: text input that accepts a typed date ─────────
-    try:
-        text_date_inputs = page.locator(
-            "input[placeholder*='date' i], input[name*='date' i], input[class*='date' i]"
-        ).all()
-        emit(f"🔎 Found {len(text_date_inputs)} text-style date input(s).")
-        for di in text_date_inputs:
-            try:
-                if not di.is_visible():
-                    continue
-            except Exception:
-                continue
-            # Try a few common display formats, since custom pickers often
-            # reject ISO and expect their own.
-            for candidate in [parsed.strftime("%d/%m/%Y"), iso, parsed.strftime("%m/%d/%Y")]:
-                di.fill(candidate)
-                actual = di.input_value()
-                if actual and actual.strip():
-                    emit(f"✅ Date field filled with '{candidate}' (reads back as '{actual}').")
-                    return True
-    except Exception as e:
-        emit(f"⚠️ Text-style date input check failed: {e}", "warn")
-
-    # ── Attempt 3: a button/control that opens a calendar widget ─
-    try:
-        calendar_triggers = page.locator(
-            "button[class*='date' i], button[class*='calendar' i], [class*='datepicker' i]"
-        ).all()
-        emit(f"🔎 Found {len(calendar_triggers)} calendar-widget trigger(s).")
-        if calendar_triggers:
-            emit("⚠️ A calendar-widget date picker was detected, but clicking through "
-                 "day/month/year cells isn't automated yet — please set the date manually.", "warn")
-    except Exception as e:
-        emit(f"⚠️ Calendar-widget date check failed: {e}", "warn")
-
-    emit(f"❌ Could not auto-set date '{date_str}' — no matching control found. "
-         f"Please set it manually on the page.", "warn")
-    return False
-
+        emit(f"⚠️ Date selection failed: {e}", "warn")
+        return False
 
 def run_automation(credentials, image_path, manual_course=None, manual_date=None, mode="auto"):
     """Main automation coroutine — runs in background thread."""
@@ -1056,44 +1010,125 @@ def run_automation(credentials, image_path, manual_course=None, manual_date=None
                     timeout=8000,
                 )
 
-                # Clear search and type student name
-                search_input = modal.locator("input[type='text'], input[type='search'], input").first
-                search_input.clear()
-                search_input.fill(name)
-                time.sleep(1.2)  # wait for search results
+                # Clear search and type student name. The portal's own
+                # search appears to be order-sensitive (it may index by
+                # first-name-first, surname-first, or something in
+                # between — and that ordering doesn't always match how a
+                # name was handwritten on the sheet or stored in the
+                # roster). So instead of a single literal query, try a
+                # few reorderings of the name's tokens and stop at the
+                # first one that returns any results at all.
+                # Confirmed from the real page source: the search box has
+                # id="student-search-input" and triggers filterStudents()
+                # on keyup, which does a synchronous, client-side,
+                # case-insensitive substring match against each row's
+                # .search-name and .search-index text — no network
+                # request, no debounce. Non-matching rows get
+                # style.display='none' (they stay in the DOM, just
+                # hidden), so matching must check actual visibility,
+                # not just presence of text.
+                search_input = modal.locator("#student-search-input")
+                if search_input.count() == 0:
+                    search_input = modal.locator("input[type='text'], input[type='search'], input").first
 
-                # Look for the student in results — the checkbox + label
-                # structure confirmed from the "Manual System Override"
-                # screenshot: each result row has its own checkbox input.
-                result_items = modal.locator("[class*='result'], li, label, [class*='student']").all()
+                # The roster's "Name" column often has a comma (e.g.
+                # "Affadu-Mensah, Judah Ekow") but the portal's own search
+                # and display never do (it shows "BRIGHT AKPENE ALBERT",
+                # space-separated, no comma, and often in yet another
+                # token order than either the roster or the handwriting).
+                # Strip the comma first so it never reaches the search box,
+                # then tokenize for the reordering attempts below.
+                name_no_comma = re.sub(r",", " ", name)
+                name_no_comma = re.sub(r"\s+", " ", name_no_comma).strip()
+                name_tokens = [w for w in name_no_comma.split() if w]
+
+                query_candidates = [name_no_comma]  # comma-free, as-given, always try first
+                if len(name_tokens) >= 2:
+                    # swap first <-> last token (covers "Surname First" vs
+                    # "First Surname" and most 2-word reorderings)
+                    swapped = name_tokens[:]
+                    swapped[0], swapped[-1] = swapped[-1], swapped[0]
+                    query_candidates.append(" ".join(swapped))
+                    # The two most distinctive (longest) tokens together —
+                    # e.g. a surname + a middle/given name — sidesteps
+                    # ordering entirely and is usually enough to surface
+                    # the right row without over-matching like a single
+                    # short token could.
+                    two_longest = sorted(name_tokens, key=len, reverse=True)[:2]
+                    query_candidates.append(" ".join(two_longest))
+                    # Fallback: just the single longest token alone.
+                    query_candidates.append(max(name_tokens, key=len))
+                # de-dupe while preserving order
+                seen_q = set()
+                query_candidates = [q for q in query_candidates if not (q in seen_q or seen_q.add(q))]
+
+                # Every candidate row, matched or not, is one of these —
+                # filterStudents() only toggles their CSS display, so we
+                # must filter by is_visible(), not by presence in the DOM.
+                all_rows_locator = modal.locator("label.student-checkbox-item")
+
+                def visible_rows():
+                    rows = all_rows_locator.all()
+                    return [r for r in rows if r.is_visible()]
+
+                result_items = []
+                used_query = name_no_comma
+                for q in query_candidates:
+                    search_input.fill("")
+                    search_input.fill(q)
+                    # filterStudents() runs synchronously on the keyup
+                    # fired by fill(), so the DOM is already updated by
+                    # the time fill() returns — no polling needed. A tiny
+                    # sleep only guards against any rendering lag.
+                    time.sleep(0.05)
+                    visible = visible_rows()
+                    if visible:
+                        result_items = visible
+                        used_query = q
+                        if q != name_no_comma:
+                            emit(f"  🔁 Query '{name_no_comma}' matched nothing — retried as '{q}', got {len(visible)} visible result(s).")
+                        break
+                else:
+                    emit(f"  ⚠️ No visible rows for any reordering of '{name_no_comma}' (tried {query_candidates}).", "warn")
+
                 found = False
 
-                # Strategy 1: find item containing the full name
+                # Strategy 1: find item containing the full name. Read
+                # .search-name specifically (the exact text the page's own
+                # filterStudents() matches against) rather than the whole
+                # row's text, which also includes the index number.
                 for item in result_items:
-                    item_text = item.inner_text().upper().strip()
-                    if name in item_text or all(word in item_text for word in name.split() if len(word) > 2):
+                    name_span = item.locator(".search-name")
+                    item_name = (name_span.inner_text() if name_span.count() > 0 else item.inner_text()).upper().strip()
+                    if name_no_comma.upper() in item_name or all(
+                        word in item_name for word in name_tokens if len(word) > 2
+                    ):
                         cb = item.locator("input[type='checkbox']")
                         if cb.count() > 0:
                             if not cb.is_checked():
                                 cb.check(timeout=3000)
                         else:
                             item.click(timeout=3000)
-                        emit(f"  ✓ Found and ticked: {item_text[:60]}")
+                        emit(f"  ✓ Found and ticked: {item_name[:60]}")
                         found = True
                         break
 
-                # Strategy 2: just check first result if search is specific enough
-                if not found:
-                    first_cb = modal.locator("input[type='checkbox']").first
-                    if first_cb.count() > 0 and first_cb.is_visible():
-                        result_label = modal.locator("label, [class*='name'], p").first
-                        result_text  = result_label.inner_text().upper() if result_label.count() > 0 else ""
-                        name_words = [w for w in name.split() if len(w) > 2]
-                        if any(w in result_text for w in name_words):
-                            if not first_cb.is_checked():
-                                first_cb.check(timeout=3000)
-                            emit(f"  ✓ Ticked first result: {result_text[:60]}")
-                            found = True
+                # Strategy 2: just check the first visible result if the
+                # search narrowed things down to a small, plausible set.
+                # Use result_items (already filtered to visible rows by
+                # the current query) rather than re-querying the modal,
+                # which would include hidden non-matching rows again.
+                if not found and result_items:
+                    first_item = result_items[0]
+                    first_cb = first_item.locator("input[type='checkbox']")
+                    name_span = first_item.locator(".search-name")
+                    result_text = (name_span.inner_text() if name_span.count() > 0 else first_item.inner_text()).upper()
+                    name_words = [w for w in name_tokens if len(w) > 2]
+                    if first_cb.count() > 0 and any(w.upper() in result_text for w in name_words):
+                        if not first_cb.is_checked():
+                            first_cb.check(timeout=3000)
+                        emit(f"  ✓ Ticked first visible result: {result_text[:60]}")
+                        found = True
 
                 # Strategy 3: fuzzy match — handwriting OCR is rarely pixel-perfect,
                 # so pick the closest-scoring visible result instead of giving up.
@@ -1103,7 +1138,7 @@ def run_automation(credentials, image_path, manual_course=None, manual_date=None
                         item_text = item.inner_text().strip()
                         if not item_text:
                             continue
-                        score = name_similarity(name, item_text)
+                        score = name_similarity(name_no_comma, item_text)
                         if score > best_score:
                             best_item, best_score, best_text = item, score, item_text
                     if best_item is not None and best_score >= 0.55:
@@ -1138,9 +1173,10 @@ def run_automation(credentials, image_path, manual_course=None, manual_date=None
                 verify_btn = modal.locator("button:has-text('VERIFY'), button:has-text('Verify')").first
                 verify_btn.wait_for(state="visible", timeout=5000)
                 verify_btn.click(timeout=5000)
-                time.sleep(1.0)
 
-                # Wait for success toast/notification
+                # Wait for success toast/notification — this wait_for_selector
+                # already blocks until either the toast appears or the timeout
+                # elapses, so no separate fixed sleep is needed beforehand.
                 try:
                     page.wait_for_selector("text=Manual override successful, text=marked present, [class*='success'], [class*='toast']", timeout=6000)
                     emit(f"  🟢 Confirmed present: {name}")
@@ -1153,9 +1189,9 @@ def run_automation(credentials, image_path, manual_course=None, manual_date=None
 
                 # Make sure the modal is actually gone before looping —
                 # this is what used to leave it stuck open for the NEXT
-                # student's attempt.
+                # student's attempt. force_close_modal already waits
+                # briefly for the close to take effect.
                 force_close_modal(page)
-                time.sleep(0.5)
 
             except PlaywrightTimeout as e:
                 emit(f"  ❌ Timeout for '{name}': {e}", "error")
